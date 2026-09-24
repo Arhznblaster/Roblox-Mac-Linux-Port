@@ -153,6 +153,22 @@ case " $* " in *" --shell "*) ;; *)      # a guest shell needs no client
 esac
 export ROBLOX_MAC_APP=$APP ROBLOX_MAC_DATA=$DATA SDL_VIDEODRIVER=${SDL_VIDEODRIVER:-wayland,x11}
 
+# X11/Cocotron fallback GL: pick the GLX vendor whose kernel driver owns a real
+# DRM device instead of assuming an NVIDIA host (which blanked the GL fallback
+# on Intel/AMD-only machines). An explicit environment value still wins.
+if [ -z "${__GLX_VENDOR_LIBRARY_NAME:-}" ]; then
+    for rbx_card in /sys/class/drm/card[0-9]/device; do
+        [ -e "$rbx_card/driver" ] || continue
+        rbx_drv=$(basename "$(readlink -f "$rbx_card/driver")")
+        case $rbx_drv in
+            nvidia) __GLX_VENDOR_LIBRARY_NAME=nvidia; break;;
+            amdgpu) __GLX_VENDOR_LIBRARY_NAME=mesa;   break;;
+            i915|xe) __GLX_VENDOR_LIBRARY_NAME=mesa;  break;;
+        esac
+    done
+    export __GLX_VENDOR_LIBRARY_NAME=${__GLX_VENDOR_LIBRARY_NAME:-mesa}
+fi
+
 if [ "${1:-}" = --prepare-shaders ]; then
     export PATH="$ROOT/usr/bin:$PATH"
     export ROBLOX_MAC_SHADER_LIBRARY_PATH="$ROOT/browser/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
@@ -262,7 +278,9 @@ done
 export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:+$LD_LIBRARY_PATH:}$HL
 
 # SDL_VIDEODRIVER (wayland first, X11 fallback) was exported before the re-exec; unshare keeps env.
-export __GLX_VENDOR_LIBRARY_NAME=${__GLX_VENDOR_LIBRARY_NAME:-nvidia}
+# GLX vendor was chosen before the re-exec (kernel-driver detection or an
+# explicit user value); unshare keeps the environment, so just carry it through.
+export __GLX_VENDOR_LIBRARY_NAME=${__GLX_VENDOR_LIBRARY_NAME:-mesa}
 
 # X11 (Xwayland). Darling's AppKit is cocotron on X11. The X socket needs no mount work: the ELF
 # side of Darling runs in this namespace's own mount view, where the host's /tmp is untouched.
@@ -293,6 +311,27 @@ if [ "${ROBLOX_MAC_RENDERER:-}" = metal ]; then
     # disk cache and recompiles materials when they appear again.
     export __GL_SHADER_DISK_CACHE=${__GL_SHADER_DISK_CACHE:-1}
     export MESA_SHADER_CACHE_DIR=$DATA/mesa-cache __GL_SHADER_DISK_CACHE_PATH=$DATA/nvidia-cache
+    # Vulkan device selection for the Metal->Vulkan renderer. By default the
+    # loader's own enumeration order is used (ANV/RADV before llvmpipe); force
+    # a driver with ROBLOX_MAC_VK_LOADER=intel|amd|lavapipe if needed.
+    case ${ROBLOX_MAC_VK_LOADER:-} in
+        intel|amd|swrast|lavapipe) export VK_LOADER_DRIVERS_SELECT="${ROBLOX_MAC_VK_LOADER}_icd.x86_64.json";;
+        '') ;;
+        *) echo "roblox-mac: ignoring unknown ROBLOX_MAC_VK_LOADER '$ROBLOX_MAC_VK_LOADER' (use intel, amd, swrast or lavapipe)" >&2;;
+    esac
+    # Log the host Vulkan drivers the guest can reach, so 'why is it on CPU'
+    # is answerable from the runtime log. RBX_VK_DEBUG=1 adds the full loader trace.
+    if [ -n "${RBX_VK_DEBUG:-}" ]; then export VK_LOADER_DEBUG=all; fi
+    rbx_vk_icds=''
+    for rbx_json in /usr/share/vulkan/icd.d/*.json /etc/vulkan/icd.d/*.json; do
+        [ -e "$rbx_json" ] || continue
+        rbx_lib=$(sed -n 's/.*"library_path"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$rbx_json" 2>/dev/null | head -1)
+        [ -n "$rbx_lib" ] || continue
+        case $rbx_lib in */*) ;; *) for rbx_dir in /usr/lib/x86_64-linux-gnu /usr/lib64 /usr/lib; do [ -e "$rbx_dir/$rbx_lib" ] && rbx_lib=$rbx_dir/$rbx_lib && break; done;; esac
+        [ -e "$rbx_lib" ] && rbx_vk_icds="$rbx_vk_icds ${rbx_json##*/}->$rbx_lib"
+    done
+    echo "roblox-mac: Vulkan ICDs available to the renderer:${rbx_vk_icds:- NONE}" >&2
+    unset rbx_vk_icds
     INSERT=$INSERT:$G$ROOT/shims/metal/libmetalgaps.dylib
 fi
 if [ "$OPTIMIZED" = 1 ]; then

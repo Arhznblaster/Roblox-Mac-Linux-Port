@@ -31,6 +31,7 @@
 !/.gitignore
 !/README.md
 !/THIRD_PARTY.md
+!/INTEL-GPU.md
 !/third_party/
 !/runtime/
 !/native/
